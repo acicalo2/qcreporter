@@ -1,0 +1,715 @@
+<!-- # Child Rmarkdown Document for Cluster Annotation -->
+<!-- Parent document must have a variable "in_rna" containing metadata-injected H5 files by sample --> 
+<a id="snrna_seq_cluster_annotation_top"></a>
+
+```{r, include=FALSE} 
+orig_workspace <- ls()
+
+snrna_seq_sample_module_version <- "1.0.0" # 
+stm("Starting snRNA Cluster Annotation Module")
+```
+
+
+### Contents 
+#### [QC Seurat Object](#seurat_qc)
+  - [Mitochondrial Percentage](#Mitochondrial_Percentage)
+  - [Ribosomal Percentage](#Ribosomal_Percentage)
+  - [UMIs Transcripts per Cell](#UMIs_transcripts_per_cell)
+  - [Genes per Cell](#Genes_Per_Cell)
+  - [UMAP-Resoultion](#UMAP_Resolution)
+  - [UMAP-Sample](#UMAP_Sample)
+  - [Marker Gene Table](#mgt) 
+<details style="color: lightgray;">  
+  <summary>Expand Code</summary> 
+
+```{r echo=FALSE,message=FALSE}
+stm("Reading in Marker Genes")
+
+if (length(grep("https",in_key)) > 0) {
+    ss <- read_sheet(in_key)
+    } else if (length(grep(".xlsx",in_key)) > 0 ){
+        ss <- import_list(in_key)
+    } else {
+        ss <- read.csv(in_key)
+}
+
+metatable <- ss$MetaTable_expectedCell
+if ("Final list" %in% colnames(metatable)) {
+    metatable <- metatable %>% filter(metatable$"Final list" == 1)
+}
+samples <- unique(metatable$Sample)
+treatments <- metatable$Treatment      
+              
+# Format Marker Genes
+MarkerGenes <- ss$MarkerGenes
+colnames(MarkerGenes) <- c('marker_gene','cell_type','ref')
+markers <- MarkerGenes$'marker_gene'
+if (species == "Homo Sapiens"){
+    markers <- toupper(markers)
+}
+
+# read in gene name table
+geneTable <- read.csv(paste0(refdir, "geneAnnotationTable.csv"), header = T, row.names = 1)
+```
+
+```{r pre_processing,echo=FALSE,message=FALSE}
+# Step 2: Pre-processing
+# Create Seurat object 
+cell_bender_mat = list()
+snrna.list = list()
+for (sample in samples){
+cell_bender_mat[[sample]] <- Read_CellBender_h5_Mat(file_name = paste0(cellbender_dir,sample,'/',sample,"_CellBender_output_file_filtered.h5"))
+snrna.list[[sample]] <- CreateSeuratObject(counts = cell_bender_mat[[sample]])
+}
+
+# Remove raw data to save memory
+rm(data.10x)
+                        
+# add treatment
+for(i in 1:length(samples)){
+  sample=samples[i]; treatment=treatments[i];
+  snrna.list[[sample]]$treatment <- treatment
+}
+
+# add sample name
+for(i in 1:length(samples)){
+  sample=samples[i]; sample_id=samples[i];
+  snrna.list[[sample]]$sample_id <- sample_id
+}
+```
+
+[Return to Contents](#snrna_seq_sample_top) 
+
+```{r echo=FALSE,message=FALSE}
+# Add percent.mt and percent.rb to cell level metadata
+for (sample in samples) {
+  snrna.list[[sample]][["percent.mito"]] <- PercentageFeatureSet(snrna.list[[sample]], pattern = "^MT:|MT-|mt:|mt-") 
+  snrna.list[[sample]][["percent.ribo"]] <- PercentageFeatureSet(snrna.list[[sample]], pattern = "^RP[LS]|Rp[LS]")
+}
+
+for (sample in samples) {
+snrna.list[[sample]] <- RenameCells(object = snrna.list[[sample]], add.cell.id = sample)
+}
+
+# merge list of prefiltered Seurat
+snrna.combined_prefilter <- Merge_Seurat_List(snrna.list,
+                                              add.cell.ids = NULL,
+                                              merge.data = TRUE,
+                                              project = "sample_id")
+# metadata variable
+metadata_prefilter <- snrna.combined_prefilter@meta.data
+names(metadata_prefilter)[names(metadata_prefilter)=="nCount_RNA"] <- "nUMI"
+names(metadata_prefilter)[names(metadata_prefilter)=="nFeature_RNA"] <- "nGene"
+snrna.combined_prefilter <- AddMetaData(
+  object = snrna.combined_prefilter,
+  metadata = metadata_prefilter)
+# Save Prefilter
+saveRDS(snrna.combined_prefilter, paste0(out_dir, "snrna.combined_prefilter.seurat.", projectName, ".rds"))
+mito_cutoff = percent_mito
+ribo_cutoff = percent_ribo                   
+# Detection based filtering
+# 300 detected genes and the genes need to be expressesd in atleast 3 cells.
+selected_c <- WhichCells(snrna.combined_prefilter, expression = nGene > 300)
+selected_f <- rownames(snrna.combined_prefilter)[Matrix::rowSums(snrna.combined_prefilter@assays$RNA@counts > 0) > 3]
+# Apply the filter
+data.filt <- subset(snrna.combined_prefilter, features = selected_f, cells = selected_c)
+# filter cells nUMI > 300
+selected_c <- WhichCells(data.filt, expression = nUMI > 300)
+data.filt <- subset(data.filt, cells = selected_c)
+# Mito/Ribo Filter
+selected_mito <- WhichCells(data.filt, expression = percent.mito <= mito_cutoff)
+selected_ribo <- WhichCells(data.filt, expression = percent.ribo <= ribo_cutoff)
+data.filt <- subset(data.filt, cells = selected_mito)
+data.filt <- subset(data.filt, cells = selected_ribo)
+#dim(data.filt)
+#table(data.filt$orig.ident)
+
+# Split Seurat Object
+snrna.list <- SplitObject(data.filt, split.by = "sample_id")
+  
+# Compute the relative expression of each gene per cell Use sparse matrix
+# operations, if your dataset is large, doing matrix devisions the regular way
+# will take a very long time.
+C = list()
+most_expressed = list()
+par(mar = c(4, 8, 2, 1))
+for (sample in samples){
+C[[sample]] <- snrna.list[[sample]]@assays$RNA@counts
+C[[sample]] <- Matrix::t(Matrix::t(C[[sample]])/Matrix::colSums(C[[sample]])) * 100
+most_expressed[[sample]] <- order(apply(C[[sample]], 1, median), decreasing = T)[20:1]
+}
+most_expressed_plots = list()
+
+most_expressed_plots = list()
+for (sample in samples){
+    pdf(paste0(out_dir,sample,"_most_expressed_genes.pdf"),width=18,height=12)
+    par(mar = c(4, 8, 2, 1))
+    boxplot(as.matrix(t(C[[sample]][most_expressed[[sample]], ])), cex = 0.1, las = 1, xlab = "% Total Count per Cell",
+    col = (scales::hue_pal())(20)[20:1], horizontal = TRUE)
+    mute <- dev.off()
+}
+
+    # Filter MALAT1
+if (filter_MALAT == TRUE){
+  for (sample in samples){
+  snrna.list[[sample]] <- snrna.list[[sample]][!grepl("MALAT1:Malat1", rownames(snrna.list[[sample]])), ]
+  }
+}
+# Filter Mitocondrial
+if (filter_MITO == TRUE){
+  for (sample in samples){
+  snrna.list[[sample]] <- snrna.list[[sample]][!grepl("^MT:|MT-|mt:|mt-", rownames(snrna.list[[sample]])), ]
+  }
+}
+# Filter Ribosomal gene (optional if that is a problem on your data) data.filt
+if (filter_RIBO == TRUE){
+  for (sample in samples){
+  snrna.list[[sample]] <- snrna.list[[sample]][!grepl("^RP[LS]|Rp[LS]", rownames(snrna.list[[sample]])), ]
+  }
+}
+
+# metadata variable
+metadata_prefilter <- snrna.combined_prefilter@meta.data
+
+metadata_prefilter_list <- list()
+for (sample in samples){
+    metadata_prefilter_list[[sample]] <- snrna.list[[sample]]@meta.data
+}
+# N Cells Prefilter
+n_cells = list()
+for (sample in samples){
+    n_cells[[sample]] <- length(rownames(metadata_prefilter_list[[sample]]))
+}
+
+prefilter_ncells_df <- as.matrix(n_cells)
+
+samples <- rownames(prefilter_ncells_df)
+NCells <- as.integer(unname(prefilter_ncells_df[,1]))
+
+n_cells_df <- as.data.frame(cbind(samples,NCells))
+
+pdf(paste0(out_dir,"prefilter_n_cells.pdf"),onefile=TRUE,height=10,width=15)
+ggplot(data = n_cells_df, aes(x=samples,y = as.integer(NCells),fill = samples)) + geom_bar(stat="identity") + geom_text(aes(label=NCells), position=position_dodge(width=0.9), vjust=-0.25) + ggtitle("Number of Cells") 
+mute <- dev.off()
+```
+```{r echo=FALSE,message=FALSE,include=FALSE}
+### Doublet Finder
+# grab number of cells
+n_cells = list()
+for (sample in samples){
+n_cells[[sample]] <- length(colnames(snrna.list[[sample]]))
+}
+multiplet_rate = list()
+for (sample in samples){
+    if (n_cells[[sample]] <= 500){
+        multiplet_rate[[sample]] = 0.004
+    }else if (n_cells[[sample]] > 500 & n_cells[[sample]] < 2000){
+             multiplet_rate[[sample]] = 0.008 
+    } else if (n_cells[[sample]] >= 2000 & n_cells[[sample]] < 3000){
+      multiplet_rate[[sample]] = 0.016 
+    } else if (n_cells[[sample]] >= 3000 & n_cells[[sample]] < 4000){
+      multiplet_rate[[sample]] = 0.024
+    } else if (n_cells[[sample]] >= 4000 & n_cells[[sample]] < 5000){
+      multiplet_rate[[sample]] = 0.032
+    } else if (n_cells[[sample]] >= 5000 & n_cells[[sample]] < 6000){
+      multiplet_rate[[sample]] = 0.040
+    } else if (n_cells[[sample]] >= 6000 & n_cells[[sample]] < 7000){
+      multiplet_rate[[sample]] = 0.048
+    } else if (n_cells[[sample]] >= 7000 & n_cells[[sample]] < 8000){
+      multiplet_rate[[sample]] = 0.056
+    } else if (n_cells[[sample]] >= 8000 & n_cells[[sample]] < 9000){
+      multiplet_rate[[sample]] = 0.064
+    } else if (n_cells[[sample]] >= 9000 & n_cells[[sample]] < 10000){
+      multiplet_rate[[sample]] = 0.072
+    }else{
+     multiplet_rate[[sample]] = 0.080
+    }
+}
+nExp = list()
+for (sample in samples){
+snrna.list[[sample]] <- snrna.list[[sample]] %>% NormalizeData()
+snrna.list[[sample]] = FindVariableFeatures(snrna.list[[sample]], verbose = F)
+snrna.list[[sample]] = ScaleData(snrna.list[[sample]],verbose = F)
+snrna.list[[sample]] = RunPCA(snrna.list[[sample]], verbose = F, npcs = 20)
+snrna.list[[sample]] = RunUMAP(snrna.list[[sample]], dims = 1:10, verbose = F)
+nExp[[sample]] <- round(ncol(snrna.list[[sample]]) * multiplet_rate[[sample]])  # expected doublets
+snrna.list[[sample]] <- suppressMessages(doubletFinder_v3(snrna.list[[sample]], pN = 0.25, pK = 0.09, nExp = nExp[[sample]], PCs = 1:10))
+}
+
+
+DF.name = list()
+for (sample in samples){
+# name of the DF prediction can change, so extract the correct column name.
+DF.name[[sample]] = colnames(snrna.list[[sample]]@meta.data)[grepl("^DF.classification", colnames(snrna.list[[sample]]@meta.data))]
+}
+# Plot the Doublet Finder results
+UMAP_plots <- list()
+for (sample in samples){
+    UMAP_plots[[sample]] <-  cowplot::plot_grid(DimPlot(scrna.list[[sample]], group.by = DF.name[[sample]]))
+}
+
+for (sample in samples){
+    pdf(paste0(out_dir,sample,"_DoubletFinder_UMAP_Plot.pdf"),width=15,height=15,onefile=TRUE)
+    print(UMAP_plots[[sample]])
+    mute <- dev.off()
+}
+
+VlnPlots = list()
+for (sample in samples){
+VlnPlots[[sample]] <- VlnPlot(snrna.list[[sample]], features = "nFeature_RNA", group.by = DF.name[[sample]], pt.size = 0.1)
+}
+
+for (sample in samples){
+    pdf(paste0(out_dir,sample,"_DoubletFinder_VlnPlot.pdf"),width=15,height=15,onefile=TRUE)
+    print(VlnPlots[[sample]])
+    mute <- dev.off()
+}
+
+# Remove the Doublet Cells
+cells.use = list()
+for (sample in samples){
+     cells.use[[sample]] <- colnames(snrna.list[[sample]])[which(snrna.list[[sample]][[]][DF.name[[sample]]] == "Singlet")]
+     snrna.list[[sample]] <- subset(snrna.list[[sample]], cells = cells.use[[sample]])
+}
+
+so_postfilter <- Merge_Seurat_List(snrna.list,
+                                              add.cell.ids = NULL,
+                                              merge.data = TRUE,
+                                              project = "sample_id")
+metadata_postfilter <- so_postfilter@meta.data
+
+metadata_postfilter_list <- list()
+for (sample in samples){
+    metadata_postfilter_list[[sample]] <- snrna.list[[sample]]@meta.data
+}
+# N Cells Postfilter
+n_cells = list()
+for (sample in samples){
+    n_cells[[sample]] <- length(rownames(metadata_postfilter_list[[sample]]))
+}
+
+postfilter_ncells_df <- as.matrix(n_cells)
+
+samples <- rownames(postfilter_ncells_df)
+NCells <- as.integer(unname(postfilter_ncells_df[,1]))
+
+n_cells_df <- as.data.frame(cbind(samples,NCells))
+
+pdf(paste0(out_dir,"postfilter_n_cells.pdf"),onefile=TRUE,height=10,width=15)
+ggplot(data = n_cells_df, aes(x = samples,y = as.integer(NCells),fill = samples)) + geom_bar(stat="identity") + geom_text(aes(label=NCells), position=position_dodge(width=0.9), vjust=-0.25) + ggtitle("Number of Cells") 
+mute <- dev.off()
+```
+### QC Plots
+<a  id="Mitochondrial_Percentage"></a> 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+metadata_prefilter <- snrna.combined_prefilter@meta.data %>% as.data.table
+metadata_postfilter <- so_postfilter@meta.data %>% as.data.table
+cell_count_prefilter  <- metadata_prefilter[, .N, by = "sample_id"]
+cell_count_prefilter <- as.data.frame(cell_count_prefilter)
+cell_count_prefilter$QC_Status <- rep("Prefilter",length(cell_count_prefilter$N))
+colnames(cell_count_prefilter) <- c("Sample","N_Cells","QC_Status")
+cell_count_postfilter <- metadata_postfilter[, .N, by = "sample_id"]
+cell_count_postfilter <- as.data.frame(cell_count_postfilter)
+cell_count_postfilter$QC_Status <- rep("Postfilter",length(cell_count_prefilter$N))
+colnames(cell_count_postfilter) <- c("Sample","N_Cells","QC_Status")
+NCellDF <- rbind(cell_count_prefilter,cell_count_postfilter)
+order <- c("Prefilter","Postfilter")
+pdf(paste0(in_dir,"N_Cells_prefilter_postfilter.pdf"),width=16,height=8)
+ggplot(NCellDF, aes(fill=factor(QC_Status,levels=order), y=N_Cells,x=Sample)) + 
+    geom_bar(position="dodge", stat="identity") + geom_text(aes(label=N_Cells), position=position_dodge(width=0.9), vjust=-0.25) + xlab("Sample") + ylab("Number of Cells") + 
+            theme(axis.title.x = element_text(size = 12, face = "bold"),
+                  axis.title.y = element_text(size = 12, face = "bold")) +
+            theme(axis.text.y=element_text(size=8,face="bold")) + 
+            theme(axis.text.x=element_text(size=8,face="bold")) + 
+            theme(legend.text=element_text(size=8,face="bold")) +
+            theme(legend.title=element_text(size=12,face="bold")) +
+            theme(legend.key.size = unit(1, 'cm')) +
+            guides(fill=guide_legend(title="Treatment"))
+mute <- dev.off()
+ggplot(NCellDF, aes(fill=factor(QC_Status,levels=order), y=N_Cells,x=Sample)) + 
+    geom_bar(position="dodge", stat="identity") + geom_text(aes(label=N_Cells), position=position_dodge(width=0.9), vjust=-0.25) + xlab("Sample") + ylab("Number of Cells") + 
+            theme(axis.title.x = element_text(size = 12, face = "bold"),
+                  axis.title.y = element_text(size = 12, face = "bold")) +
+            theme(axis.text.y=element_text(size=8,face="bold")) + 
+            theme(axis.text.x=element_text(size=8,face="bold")) + 
+            theme(legend.text=element_text(size=8,face="bold")) +
+            theme(legend.title=element_text(size=12,face="bold")) +
+            theme(legend.key.size = unit(1, 'cm')) +
+            guides(fill=guide_legend(title="Treatment"))
+snrna.list <- SplitObject(snrna.combined_prefilter, split.by = "sample_id")
+# Prefilter
+plots <- list()
+for (sample in samples){
+     plots[[sample]] <- snrna.list[[sample]]@meta.data %>% ggplot(aes(x=nUMI, y=nGene, color=percent.mito)) + 
+     geom_point() + 
+     scale_colour_gradient(low = "gray90", high = "black") +
+     stat_smooth(method=lm) +
+     scale_x_log10() +
+     scale_y_log10() + 
+     theme_classic() +
+     geom_vline(xintercept = 500) +
+     geom_hline(yintercept = 300) +
+     facet_wrap(~sample_id) + ggtitle("Prefilter Mitochondrial Percentage")
+}
+
+pdf(paste0(out_dir,"prefilter_scatter.pdf"))
+print(plots)
+mute <- dev.off()
+print(plots)
+
+
+# Postfilter
+snrna.list <- SplitObject(so_postfilter , split.by = "sample_id")
+plots <- list()
+for (sample in samples){
+     plots[[sample]] <- snrna.list[[sample]]@meta.data %>% ggplot(aes(x=nUMI, y=nGene, color=percent.mito)) + 
+     geom_point() + 
+     scale_colour_gradient(low = "gray90", high = "black") +
+     stat_smooth(method=lm) +
+     scale_x_log10() +
+     scale_y_log10() + 
+     theme_classic() +
+     geom_vline(xintercept = 500) +
+     geom_hline(yintercept = 300) +
+     facet_wrap(~sample_id) + ggtitle("Postfilter Mitochondrial Percentage")
+}
+
+pdf(paste0(out_dir,"postfilter_scatter.pdf"))
+print(plots)
+
+mute <- dev.off()
+print(plots)
+
+```
+<a  id="Ribosomal_Percentage"></a> 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+# ribo
+# Prefilter
+plots <- list()
+for (sample in samples){
+     plots[[sample]] <- snrna.list[[sample]]@meta.data %>% ggplot(aes(x=nUMI, y=nGene, color=percent.ribo)) + 
+     geom_point() + 
+     scale_colour_gradient(low = "gray90", high = "black") +
+     stat_smooth(method=lm) +
+     scale_x_log10() +
+     scale_y_log10() + 
+     theme_classic() +
+     geom_vline(xintercept = 500) +
+     geom_hline(yintercept = 300) +
+     facet_wrap(~sample_id) + ggtitle("Prefilter Ribo Percentage")
+}
+
+pdf(paste0(out_dir,"prefilter_scatter.pdf"))
+print(plots)
+mute <- dev.off()
+print(plots)
+
+# Postfilter
+plots <- list()
+for (sample in samples){
+     plots[[sample]] <- snrna.list[[sample]]@meta.data %>% ggplot(aes(x=nUMI, y=nGene, color=percent.ribo)) + 
+     geom_point() + 
+     scale_colour_gradient(low = "gray90", high = "black") +
+     stat_smooth(method=lm) +
+     scale_x_log10() +
+     scale_y_log10() + 
+     theme_classic() +
+     geom_vline(xintercept = 500) +
+     geom_hline(yintercept = 300) +
+     facet_wrap(~sample_id) + ggtitle("Postfilter Ribo Percentage")
+}
+
+pdf(paste0(out_dir,"postfilter_scatter.pdf"))
+print(plots)
+mute <- dev.off()
+print(plots)
+```
+<a  id="UMIs_transcripts_per_cell"></a> 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+UMIs_transcripts_per_cell_prefilter <- metadata_prefilter %>% 
+  	ggplot(aes(color=sample_id, x=nUMI, fill= sample_id)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 500) + 
+    ggtitle("Prefilter UMIs Transcripts Per Cell")
+
+UMIs_transcripts_per_cell_postfilter <- metadata_postfilter %>% 
+  	ggplot(aes(color=sample_id, x=nUMI, fill= sample_id)) + 
+  	geom_density(alpha = 0.2) + 
+  	scale_x_log10() + 
+  	theme_classic() +
+  	ylab("Cell density") +
+  	geom_vline(xintercept = 500) + 
+    ggtitle("Postfilter UMIs Transcripts Per Cell")
+
+p <- ggarrange(UMIs_transcripts_per_cell_prefilter,UMIs_transcripts_per_cell_postfilter,ncol=1,nrow=2)
+pdf(paste0(out_dir,"UMI_Transcripts_Per_Cell.pdf"))
+print(p + coord_fixed())
+
+mute <- dev.off()
+print(p + coord_fixed())
+
+```
+<a  id="Genes Per Cell"></a> 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+genes_per_cell_pre <- metadata_prefilter %>% 
+  	ggplot(aes(color=sample_id, x=nGene, fill=sample_id )) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300) + 
+    ggtitle("Prefilter Genes Per Cell")
+
+genes_per_cell_post <- metadata_postfilter %>% 
+  	ggplot(aes(color=sample_id, x=nGene, fill=sample_id )) + 
+  	geom_density(alpha = 0.2) + 
+  	theme_classic() +
+  	scale_x_log10() + 
+  	geom_vline(xintercept = 300) + 
+    ggtitle("Postfilter Genes Per Cell")
+
+p <- ggarrange(genes_per_cell_pre,genes_per_cell_post,ncol=1,nrow=2)
+pdf(paste0(out_dir,"Genes_Per_Cell.pdf"))
+print(p + coord_fixed())
+mute <- dev.off()
+print(p + coord_fixed())
+
+
+```
+[Return to Contents](#snrna_seq_sample_top) 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+# Integration
+# normalize and identify variable features for each dataset independently
+snrna.list <- SplitObject(so_postfilter, split.by = "sample_id")
+snrna.list <- lapply(X = snrna.list, FUN = function(x) {
+    x <- NormalizeData(x,verbose=FALSE)
+    x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 2000,verbose=FALSE)
+})
+# select features that are repeatedly variable across datasets for integration
+features <- SelectIntegrationFeatures(object.list = snrna.list)
+# Perform integration
+snrna.anchors <- FindIntegrationAnchors(object.list = snrna.list, anchor.features = features,verbose=FALSE)
+snrna.combined <- IntegrateData(anchorset = snrna.anchors, dims = 1:30, new.assay.name = "CCA",verbose=FALSE)
+rm(snrna.anchors)
+# Perform an integrated analysis
+DefaultAssay(snrna.combined) <- "CCA"
+snrna.combined <- ScaleData(snrna.combined, verbose = FALSE)
+snrna.combined <- RunPCA(snrna.combined, npcs = 30, verbose = FALSE)
+           
+```
+<a  id="elbow_plot"></a> 
+```{r, echo=FALSE,results='hide',fig.keep='all'}
+    pdf(paste0(out_dir, "ElbowPlot.pdf"))
+    p1 <- ElbowPlot(snrna.combined) + ggtitle("Integrated") + theme(aspect.ratio=5/10) + theme(plot.margin = unit(c(6, 6, 6, 6), "cm"))
+    print(p1 + coord_fixed())
+    mute <- dev.off()
+
+```
+<a  id="UMAP_Resolution"></a> 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+# Continue on analysis
+snrna.combined <- FindNeighbors(snrna.combined, dims = 1:30, k.param = 60, prune.SNN = 1/15)
+snrna.combined <- FindClusters(snrna.combined, graph.name = "CCA_snn", resolution = seq(0.5,3,by=0.1),algorithm = alg,verbose=FALSE)
+snrna.combined <- RunUMAP(snrna.combined, reduction = "pca", dims = 1:30,verbose=FALSE)
+res_0.5 <- DimPlot(snrna.combined, group.by = "CCA_snn_res.0.5", label = TRUE)
+pdf(paste0(out_dir, "res_0.5.pdf"))
+print(res_0.5 + coord_fixed())
+mute <- dev.off()
+print(res_0.5 + coord_fixed())
+res_0.7 <- DimPlot(snrna.combined, group.by = "CCA_snn_res.0.7", label = TRUE)
+pdf(paste0(out_dir, "res_0.7.pdf"))
+print(res_0.7 + coord_fixed())
+mute <- dev.off()
+res_1 <- DimPlot(snrna.combined, group.by = "CCA_snn_res.1", label = TRUE)
+pdf(paste0(out_dir, "res_1.pdf"))
+print(res_1 + coord_fixed())
+mute <- dev.off()
+print(res_1 + coord_fixed())
+res_1.2 <- DimPlot(snrna.combined, group.by = "CCA_snn_res.1.2", label = TRUE)
+pdf(paste0(out_dir, "res_1.2.pdf"))
+print(res_1.2 + coord_fixed())
+mute <- dev.off()
+res_1.4 <- DimPlot(snrna.combined, group.by = "CCA_snn_res.1.4", label = TRUE)
+pdf(paste0(out_dir, "res_1.4.pdf"))
+print(res_1.4 + coord_fixed())
+mute <- dev.off()
+res_2 <- DimPlot(snrna.combined, group.by = "CCA_snn_res.2", label = TRUE)
+pdf(paste0(out_dir, "res_2.pdf"))
+print(res_2 + coord_fixed())
+mute <- dev.off()
+print(res_2 + coord_fixed())
+meta <- snrna.combined@meta.data
+Idents(snrna.combined) <- resolution
+rm(snrna.list)
+```
+<a  id="UMAP_Sample"></a> 
+```{r, echo=FALSE,message=FALSE,results='hide',fig.keep='all'}
+p1 <- DimPlot(snrna.combined, reduction = "umap", group.by = "sample_id")
+pdf(file=paste0(out_dir, "combined.umap.colorBySample.pdf"))
+print(p1 + coord_fixed())
+mute <- dev.off()
+print(p1 + coord_fixed())
+p2 <- DimPlot(snrna.combined, reduction = "umap", label = TRUE, repel = TRUE)
+pdf(paste0(out_dir, "combined.umap.colorByCluster.pdf"))
+print(p2 + coord_fixed())
+mute <- dev.off()
+p4 <- DimPlot(snrna.combined, reduction = "umap", group.by = "treatment")
+pdf(file=paste0(out_dir, "combined.umap.colorByTreatment.pdf"))
+print(p4 + coord_fixed())
+mute <- dev.off() 
+saveRDS(snrna.combined, paste0(out_dir, "snrna.combined_postfilter.seurat.", projectName, ".rds"))
+```
+
+[Return to Contents](#snrna_seq_sample_top) 
+
+```{r echo=FALSE,message=FALSE}
+meta <- snrna.combined@meta.data
+Idents(snrna.combined) <- resolution
+# Find Markers
+DefaultAssay(snrna.combined) <- "RNA"
+markers_genes <- FindAllMarkers(snrna.combined, log2FC.threshold = 0.2, test.use = "wilcox",
+    min.pct = 0.1, min.diff.pct = 0.2, only.pos = TRUE, max.cells.per.ident = 50,
+    assay = "RNA")
+names(markers_genes)[names(markers_genes) == "gene"] <- "geneSymbol"
+markers_genes$geneID <- geneTable$geneID[match(markers_genes$geneSymbol, geneTable$geneSymbol)]
+write.table(markers_genes, paste0(out_dir, "FindAllMarkers.clusters.xls"), sep = "\t", row.names = F)
+# top 10
+top10<- markers_genes %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+write.table(top10, paste0(out_dir, "FindAllMarkers.clusters.top10.xls"), sep = "\t", col.names = NA)
+
+# top 25
+top25 <- markers_genes %>% group_by(cluster) %>% top_n(n = 25, wt = avg_log2FC)
+write.table(top25, paste0(out_dir, "FindAllMarkers.clusters.top25.xls"), sep = "\t", col.names = NA)
+
+# top 50
+top50 <- markers_genes %>% group_by(cluster) %>% top_n(n = 50, wt = avg_log2FC)
+write.table(top50, paste0(out_dir, "FindAllMarkers.clusters.top50.xls"), sep = "\t", col.names = NA)
+
+# Step 6: Top 3 identified genes, feature plot, dotplot
+topN <- Extract_Top_Markers(markers_genes, num_genes = 25, named_vector = FALSE, make_unique = TRUE, gene_column = "geneSymbol")
+
+# Feature plot
+pdf(paste0(out_dir, "combined.top25markers.pdf"))
+ggp = list()
+for (marker in topN){
+    ggp[[marker]]=FeaturePlot(snrna.combined, features=marker)
+    print(ggp[[marker]])
+}
+mute <- dev.off()
+# Dotplot
+remove_markers <- setdiff(markers,row.names(snrna.combined))
+markers <- markers[!markers%in%remove_markers]
+markers <- unique(markers)
+
+pdf(paste0(out_dir, "combined.markers.geneSymbol.pdf"))
+ggp = list()
+for (marker in markers){
+    ggp[[marker]]=FeaturePlot(snrna.combined, features=marker,min.cutoff = 0) + ggtitle(marker)
+    print(ggp[[marker]])
+}
+mute <- dev.off()
+
+pdf(paste0(out_dir, "combined.dotplot.geneSymbol.pdf"), width = 30, height = 10)
+p1 <- DotPlot_scCustom(snrna.combined, features = markers, x_lab_rotate = TRUE) + scale_x_discrete(breaks= markers)
+print(p1)
+mute <- dev.off()
+``` 
+
+<a  id="mgt"></a> 
+```{r echo=FALSE,message=FALSE}
+markers_genes_sig <- markers_genes[markers_genes$p_val_adj <= 0.05,]            
+# Create Interactive Table
+if (species == "Mus musculus"){
+tibble::as_tibble(unique(markers_genes_sig)) %>% dplyr::arrange(p_val_adj) -> markers_genes_sig
+markers_genes_sig = markers_genes_sig %>% dplyr::select(cluster, geneSymbol, p_val, avg_log2FC,
+                                             p_val_adj,pct.1,pct.2,geneID)
+final_df <- data.frame(           "cluster"    = markers_genes_sig$cluster,
+                                  "gene"       = markers_genes_sig$geneSymbol,
+                                  "p_val"      = markers_genes_sig$p_val,
+                                  "avg_log2FC" = markers_genes_sig$avg_log2FC,
+                                  "p_val_adj"  = markers_genes_sig$p_val_adj,
+                                  "pct.1"      = markers_genes_sig$pct.1,
+                                  "pct.2"      = markers_genes_sig$pct.2,
+                                  "MGI_ID" = paste0("<a  href='https://www.informatics.jax.org/quicksearch/summary?queryType=exactPhrase&query=",markers_genes_sig$geneID,"'>", markers_genes_sig$geneID,"</a>"))
+
+DT::datatable(final_df,class = 'cell-border stripe',rownames=F,filter='top',
+              editable = TRUE, extensions = 'Buttons', options = list(
+                dom = 'Bfrtip',
+                buttons = c('copy','csv','excel','pdf','print')
+              ),escape = FALSE)
+}
+if (species == "Drosophila Melanogaster"){
+as_tibble(unique(markers_genes_sig)) %>% arrange(p_val_adj) -> markers_genes_sig
+markers_genes_sig = markers_genes_sig %>% dplyr::select(cluster, geneSymbol, p_val, avg_log2FC,
+                                             p_val_adj,pct.1,pct.2,geneID)
+final_df <- data.frame(           "cluster"    = markers_genes_sig$cluster,
+                                  "gene"       = markers_genes_sig$geneSymbol,
+                                  "p_val"      = markers_genes_sig$p_val,
+                                  "avg_log2FC" = markers_genes_sig$avg_log2FC,
+                                  "p_val_adj"  = markers_genes_sig$p_val_adj,
+                                  "pct.1"      = markers_genes_sig$pct.1,
+                                  "pct.2"      = markers_genes_sig$pct.2,
+                                  "FlyBase_ID" = paste0("<a  href='https://flybase.org/reports/",markers_genes_sig$geneID,"'>", markers_genes_sig$geneID,"</a>"))
+
+DT::datatable(final_df,class = 'cell-border stripe',rownames=F,filter='top',
+              editable = TRUE, extensions = 'Buttons', options = list(
+                dom = 'Bfrtip',
+                buttons = c('copy','csv','excel','pdf','print')
+              ),escape = FALSE)
+}
+            
+if (species == "Homo Sapiens"){
+# Create Interactive Table
+tibble::as_tibble(unique(markers_genes_sig)) %>% dplyr::arrange(p_val_adj) -> markers_genes_sig
+markers_genes_sig = markers_genes_sig %>% dplyr::select(cluster, geneSymbol, p_val, avg_log2FC,
+                                             p_val_adj,pct.1,pct.2,geneID)
+final_df <- data.frame(           "cluster"    = markers_genes_sig$cluster,
+                                  "gene"       = markers_genes_sig$geneSymbol,
+                                  "p_val"      = markers_genes_sig$p_val,
+                                  "avg_log2FC" = markers_genes_sig$avg_log2FC,
+                                  "p_val_adj"  = markers_genes_sig$p_val_adj,
+                                  "pct.1"      = markers_genes_sig$pct.1,
+                                  "pct.2"      = markers_genes_sig$pct.2,
+                                  "GeneCards" = paste0("<a  href='https://www.genecards.org/Search/Keyword?queryString=",markers_genes_sig$geneID,"'>", markers_genes_sig$geneID,"</a>"))
+
+DT::datatable(final_df,class = 'cell-border stripe',rownames=F,filter='top',
+              editable = TRUE, extensions = 'Buttons', options = list(
+                dom = 'Bfrtip',
+                buttons = c('copy','csv','excel','pdf','print')
+              ),escape = FALSE)
+}
+            
+```
+
+```{r echo=FALSE,message=FALSE}
+remove_markers <- setdiff(markers,row.names(snrna.combined))
+markers <- markers[!markers%in%remove_markers]
+markers <- unique(markers)
+pdf(paste0(out_dir, "combined.markers.geneSymbol.pdf"))
+ggp = list()
+for (marker in markers){
+    ggp[[marker]]=FeaturePlot(snrna.combined, features=marker) + ggtitle(marker)
+    print(ggp[[marker]])
+}
+mute <- dev.off()
+  
+pdf(paste0(out_dir, "combined.dotplot.geneSymbol.pdf"), width = 30, height = 10)
+p1 <- scCustomize::DotPlot_scCustom(snrna.combined, features = markers, x_lab_rotate = TRUE) + scale_x_discrete(breaks= markers)
+print(p1)
+mute <- dev.off()
+      
+
+  
+```
+ ---  
+
+
+snrna seq report well module v.`r {snrna_seq_sample_module_version}`, Brigham and Women's Bioinformatics and Genomics Hub  
+
+```{r snrna_cleanup_cluster_annotation_, include = FALSE}
+module_vars <- setdiff(ls(), orig_workspace)
+rm(list=module_vars)
+gc()
+```
